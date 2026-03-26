@@ -130,7 +130,6 @@ Respond ONLY with a JSON array, no markdown:
         max_tokens=1200,
         tools=[{"type": "web_search_20250305", "name": "web_search"}],
         messages=[{"role": "user", "content": prompt}],
-        timeout=90,
     )
     text = "".join(b.text for b in message.content if hasattr(b, "text"))
     text = text.replace("```json", "").replace("```", "").strip()
@@ -142,7 +141,6 @@ Respond ONLY with a JSON array, no markdown:
         model="claude-sonnet-4-5",
         max_tokens=200,
         messages=[{"role": "user", "content": f"In 2-3 neutral sentences, summarize the macro/geopolitical backdrop for investors today based on: {json.dumps([i['headline'] for i in items])}"}],
-        timeout=30,
     )
     summary = summary_msg.content[0].text.strip()
     return {"summary": summary, "items": items}
@@ -174,7 +172,6 @@ Respond ONLY with a JSON object, no markdown, no extra text:
                 max_tokens=2000,
                 tools=[{"type": "web_search_20250305", "name": "web_search"}],
                 messages=[{"role": "user", "content": prompt}],
-                timeout=120,
             )
             text = "".join(b.text for b in message.content if hasattr(b, "text"))
             text = text.replace("```json", "").replace("```", "").strip()
@@ -444,7 +441,7 @@ def main():
     today_str = now.strftime("%A, %B %-d, %Y")
     print(f"🚀 Running Daily Brief for {today_str}")
 
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=120.0)
 
     print("📈 Fetching market data...")
     market_data = fetch_market_data()
