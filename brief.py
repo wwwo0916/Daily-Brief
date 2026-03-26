@@ -51,9 +51,14 @@ def fetch_market_data():
             url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=5d"
             r = requests.get(url, headers=headers, timeout=15)
             data = r.json()
-            meta = data["chart"]["result"][0]["meta"]
-            price = meta.get("regularMarketPrice") or meta.get("previousClose", 0)
-            prev  = meta.get("chartPreviousClose") or meta.get("previousClose", price)
+            result = data.get("chart", {}).get("result")
+            if not result:
+                raise ValueError("No result in response")
+            meta = result[0].get("meta", {})
+            price = meta.get("regularMarketPrice") or meta.get("previousClose")
+            if price is None:
+                raise ValueError("No price found")
+            prev = meta.get("chartPreviousClose") or meta.get("previousClose") or price
             change_pct = ((price - prev) / prev * 100) if prev else 0
             sign  = "+" if change_pct >= 0 else ""
             arrow = "▲" if change_pct > 0 else ("▼" if change_pct < 0 else "—")
@@ -125,12 +130,16 @@ Respond ONLY with a JSON array, no markdown:
 [
   {{"headline": "short headline", "detail": "one neutral factual sentence", "category": "Macro|Geopolitics|Trade|Energy|Finance|Policy", "url": "source URL or null"}}
 ]"""
-    message = client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=1200,
-        tools=[{"type": "web_search_20250305", "name": "web_search"}],
-        messages=[{"role": "user", "content": prompt}],
-    )
+    try:
+        message = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=1200,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except Exception as e:
+        print(f"❌ Anthropic API error in fetch_must_know: {type(e).__name__}: {e}")
+        raise
     text = "".join(b.text for b in message.content if hasattr(b, "text"))
     text = text.replace("```json", "").replace("```", "").strip()
     start, end = text.find("["), text.rfind("]")
@@ -444,16 +453,43 @@ def main():
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=120.0)
 
     print("📈 Fetching market data...")
-    market_data = fetch_market_data()
-    fg          = fetch_fear_greed()
-    cfg         = fetch_crypto_fear_greed()
-    cpi         = fetch_us_cpi()
+    try:
+        market_data = fetch_market_data()
+    except Exception as e:
+        print(f"⚠️ Market data failed: {e}")
+        market_data = {}
+
+    try:
+        fg = fetch_fear_greed()
+    except Exception as e:
+        print(f"⚠️ CNN F&G failed: {e}")
+        fg = {"score": None, "label": "Unavailable"}
+
+    try:
+        cfg = fetch_crypto_fear_greed()
+    except Exception as e:
+        print(f"⚠️ Crypto F&G failed: {e}")
+        cfg = {"score": None, "label": "Unavailable"}
+
+    try:
+        cpi = fetch_us_cpi()
+    except Exception as e:
+        print(f"⚠️ CPI failed: {e}")
+        cpi = {"value": "N/A", "yoy": "N/A", "date": "N/A"}
 
     print("🌍 Fetching must-know news...")
-    must_know = fetch_must_know(client, today_str)
+    try:
+        must_know = fetch_must_know(client, today_str)
+    except Exception as e:
+        print(f"⚠️ Must-know failed: {e}")
+        must_know = {"summary": "Could not fetch global news today.", "items": []}
 
-    print("📰 Fetching topic news...")
-    topic_news = fetch_topic_news(client, today_str)
+    print("📰 Fetching topic news (batch 1/3)...")
+    try:
+        topic_news = fetch_topic_news(client, today_str)
+    except Exception as e:
+        print(f"⚠️ Topic news failed: {e}")
+        topic_news = {}
 
     print("✉️  Building and sending email...")
     html = build_html(today_str, must_know, topic_news, market_data, fg, cfg, cpi)
