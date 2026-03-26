@@ -316,38 +316,45 @@ def build_html(today_str, must_know, topic_news, market_data, fg, cfg, cpi):
     # ── Must Know section ──
     must_know_rows = ""
     for item in must_know.get("items", []):
-        url_str = f'<a href="{item["url"]}" style="font-size:11px;color:#999;text-decoration:none">source ↗</a>' if item.get("url") else ""
-        must_know_rows += f"""
+        try:
+            url_str = f'<a href="{item["url"]}" style="font-size:11px;color:#999;text-decoration:none">source ↗</a>' if item.get("url") else ""
+            must_know_rows += f"""
         <tr><td style="padding:12px 16px;border-bottom:1px solid #f0f0f0">
           <table width="100%" cellpadding="0" cellspacing="0">
-            <tr><td>{cat_pill(item['category'])}</td><td align="right">{url_str}</td></tr>
-            <tr><td colspan="2" style="padding-top:6px;font-size:14px;font-weight:600;color:#1a1a1a;line-height:1.4">{item['headline']}</td></tr>
-            <tr><td colspan="2" style="padding-top:4px;font-size:13px;color:#555;line-height:1.55">{item['detail']}</td></tr>
+            <tr><td>{cat_pill(item.get('category',''))}</td><td align="right">{url_str}</td></tr>
+            <tr><td colspan="2" style="padding-top:6px;font-size:14px;font-weight:600;color:#1a1a1a;line-height:1.4">{item.get('headline','')}</td></tr>
+            <tr><td colspan="2" style="padding-top:4px;font-size:13px;color:#555;line-height:1.55">{item.get('detail','')}</td></tr>
           </table>
         </td></tr>"""
+        except Exception as e:
+            print(f"⚠️ Skipping must-know item: {e}")
 
     # ── Tracked Topics section ──
     topic_rows = ""
     for topic in TOPICS:
-        items = topic_news.get(topic, [])
-        if not items:
-            continue
-        b = sum(1 for i in items if i.get("sentiment") == "bullish")
-        r = sum(1 for i in items if i.get("sentiment") == "bearish")
-        overall = "bullish" if b > r else ("bearish" if r > b else "neutral")
-        bullets = ""
-        for item in items:
-            s = item.get("sentiment", "neutral")
-            _, col, dot = SENTIMENT_COLORS.get(s, ("#F1EFE8","#5F5E5A","#888"))
-            url_str = f' <a href="{item["url"]}" style="font-size:11px;color:#aaa;text-decoration:none">↗</a>' if item.get("url") else ""
-            bullets += f"""
-            <tr><td style="padding:8px 0;border-bottom:1px solid #f5f5f5;vertical-align:top">
-              <table cellpadding="0" cellspacing="0"><tr>
-                <td style="padding-top:5px;width:14px"><span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:{dot}"></span></td>
-                <td style="font-size:13px;color:#333;line-height:1.55;padding-left:4px">{item['text']}{url_str}</td>
-              </tr></table>
-            </td></tr>"""
-        topic_rows += f"""
+        try:
+            items = topic_news.get(topic, [])
+            if not items:
+                continue
+            b = sum(1 for i in items if i.get("sentiment") == "bullish")
+            r = sum(1 for i in items if i.get("sentiment") == "bearish")
+            overall = "bullish" if b > r else ("bearish" if r > b else "neutral")
+            bullets = ""
+            for item in items:
+                try:
+                    s = item.get("sentiment", "neutral")
+                    _, col, dot = SENTIMENT_COLORS.get(s, ("#F1EFE8","#5F5E5A","#888"))
+                    url_str = f' <a href="{item["url"]}" style="font-size:11px;color:#aaa;text-decoration:none">↗</a>' if item.get("url") else ""
+                    bullets += f"""
+                <tr><td style="padding:8px 0;border-bottom:1px solid #f5f5f5;vertical-align:top">
+                  <table cellpadding="0" cellspacing="0"><tr>
+                    <td style="padding-top:5px;width:14px"><span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:{dot}"></span></td>
+                    <td style="font-size:13px;color:#333;line-height:1.55;padding-left:4px">{item.get('text','')}{url_str}</td>
+                  </tr></table>
+                </td></tr>"""
+                except Exception as e:
+                    print(f"⚠️ Skipping bullet for {topic}: {e}")
+            topic_rows += f"""
         <tr><td style="padding:14px 0 6px">
           <table width="100%" cellpadding="0" cellspacing="0">
             <tr>
@@ -358,6 +365,8 @@ def build_html(today_str, must_know, topic_news, market_data, fg, cfg, cpi):
           <table width="100%" cellpadding="0" cellspacing="0" style="margin-top:4px">{bullets}</table>
         </td></tr>
         <tr><td style="height:1px;background:#eeeeee"></td></tr>"""
+        except Exception as e:
+            print(f"⚠️ Skipping topic {topic}: {e}")
 
     # ── Market rows ──
     equity_cards = "".join(metric_card(n, market_data[n]) for n in ["S&P 500","Nasdaq 100","Nikkei 225","Hang Seng","DAX"] if n in market_data)
