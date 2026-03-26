@@ -8,6 +8,7 @@ import requests
 import smtplib
 import json
 import os
+import time
 from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -163,7 +164,10 @@ def fetch_topic_news(client, today_str):
         ["Ethereum", "Cardano", "RWA (Real World Assets)", "DeFi & Stablecoin", "Crypto Regulation"],
     ]
     all_results = {}
-    for batch in BATCHES:
+    for i, batch in enumerate(BATCHES):
+        if i > 0:
+            print(f"⏳ Waiting 65s before batch {i+1} to respect rate limits...")
+            time.sleep(65)
         topics_str = ", ".join(batch)
         prompt = f"""Today is {today_str}. Search for the latest news (last 24h) for these topics: {topics_str}.
 
