@@ -5,19 +5,15 @@ Runs every morning, fetches live data via Anthropic API, sends HTML email.
 
 import anthropic
 import requests
-import smtplib
 import json
 import os
 import time
 from datetime import datetime, timezone, timedelta
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 
 # ── Config (loaded from environment variables) ────────────────────────────────
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-GMAIL_ADDRESS     = os.environ["GMAIL_ADDRESS"]      # your Gmail address
-GMAIL_APP_PASSWORD= os.environ["GMAIL_APP_PASSWORD"] # Gmail App Password (not your login password)
-TO_EMAIL          = os.environ["TO_EMAIL"]           # who receives the brief (can be same as above)
+ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
+SHEETS_WEBHOOK_URL = os.environ["SHEETS_WEBHOOK_URL"]
+WEBHOOK_SECRET     = os.environ["WEBHOOK_SECRET"]
 
 # ── Tracked topics ────────────────────────────────────────────────────────────
 TOPICS = [
@@ -200,282 +196,72 @@ Respond ONLY with a JSON object, no markdown, no extra text:
     return all_results
 
 
-# ── 3. Build HTML email ───────────────────────────────────────────────────────
-CAT_COLORS = {
-    "Macro":       ("#E6F1FB", "#0C447C"),
-    "Geopolitics": ("#FCEBEB", "#791F1F"),
-    "Trade":       ("#FAEEDA", "#633806"),
-    "Energy":      ("#EAF3DE", "#27500A"),
-    "Finance":     ("#EEEDFE", "#3C3489"),
-    "Policy":      ("#F1EFE8", "#444441"),
-}
+# ── 3. Build JSON payload for Google Sheets ───────────────────────────────────
+def build_payload(today_str, now_taipei, must_know, topic_news, market_data, fg, cfg, cpi):
+    # Equity
+    equity = []
+    for name in ["S&P 500", "Nasdaq 100", "Nikkei 225", "Hang Seng", "DAX"]:
+        d = market_data.get(name, {})
+        equity.append({"name": name, "price": d.get("price","N/A"), "change_pct": d.get("change_pct",0), "change_label": d.get("change_label","—")})
 
-SENTIMENT_COLORS = {
-    "bullish": ("#EAF3DE", "#3B6D11", "#639922"),
-    "bearish": ("#FCEBEB", "#A32D2D", "#E24B4A"),
-    "neutral": ("#F1EFE8", "#5F5E5A", "#888780"),
-}
+    # Commodities
+    commodities = []
+    for name in ["WTI Crude Oil", "Natural Gas", "Gold", "Silver"]:
+        d = market_data.get(name, {})
+        commodities.append({"name": name, "price": d.get("price","N/A"), "change_pct": d.get("change_pct",0), "change_label": d.get("change_label","—"), "note": d.get("note","")})
 
+    # Macro
+    macro = []
+    for name in ["VIX", "DXY Dollar Index"]:
+        d = market_data.get(name, {})
+        macro.append({"name": name, "price": d.get("price","N/A"), "change_pct": d.get("change_pct",0), "change_label": d.get("change_label","—"), "note": d.get("note","")})
+    macro.append({"name": "CNN Fear & Greed", "price": str(fg.get("score","—")), "change_pct": 0, "change_label": "", "note": fg.get("label","")})
+    macro.append({"name": "Crypto Fear & Greed", "price": str(cfg.get("score","—")), "change_pct": 0, "change_label": "", "note": cfg.get("label","")})
+    macro.append({"name": "US CPI (YoY)", "price": cpi.get("yoy","N/A"), "change_pct": 0, "change_label": f"as of {cpi.get('date','')}", "note": ""})
 
-def fear_greed_color(score):
-    if score is None: return "#888780"
-    if score <= 25:  return "#E24B4A"
-    if score <= 45:  return "#E07820"
-    if score <= 55:  return "#888780"
-    if score <= 75:  return "#639922"
-    return "#1D9E75"
-
-
-def fear_greed_label(score):
-    if score is None: return "N/A"
-    if score <= 25:  return "Extreme Fear"
-    if score <= 45:  return "Fear"
-    if score <= 55:  return "Neutral"
-    if score <= 75:  return "Greed"
-    return "Extreme Greed"
-
-
-def market_change_style(change_pct):
-    if change_pct > 0:  return "color:#3B6D11;background:#EAF3DE"
-    if change_pct < 0:  return "color:#A32D2D;background:#FCEBEB"
-    return "color:#5F5E5A;background:#F1EFE8"
-
-
-def build_html(today_str, must_know, topic_news, market_data, fg, cfg, cpi):
-    now_taipei = datetime.now(TAIPEI_TZ).strftime("%I:%M %p TPE")
-
-    # ── Helpers ──
-    def section_header(title, color):
-        return f"""
-        <tr><td style="padding:28px 0 10px">
-          <table width="100%" cellpadding="0" cellspacing="0"><tr>
-            <td style="width:3px;background:{color};border-radius:2px">&nbsp;</td>
-            <td style="padding-left:10px;font-size:13px;font-weight:600;color:#1a1a1a;letter-spacing:.04em;text-transform:uppercase">{title}</td>
-          </tr></table>
-        </td></tr>"""
-
-    def cat_pill(cat):
-        bg, col = CAT_COLORS.get(cat, ("#F1EFE8", "#444441"))
-        return f'<span style="display:inline-block;padding:2px 9px;border-radius:20px;font-size:11px;font-weight:600;background:{bg};color:{col}">{cat}</span>'
-
-    def sentiment_dot(s):
-        _, _, dot = SENTIMENT_COLORS.get(s, ("#F1EFE8","#5F5E5A","#888"))
-        return f'<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:{dot};margin-right:6px;vertical-align:middle"></span>'
-
-    def sentiment_pill(s):
-        bg, col, dot = SENTIMENT_COLORS.get(s, ("#F1EFE8","#5F5E5A","#888"))
-        label = s.capitalize()
-        return f'<span style="display:inline-flex;align-items:center;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:600;background:{bg};color:{col}">{sentiment_dot(s)}{label}</span>'
-
-    def metric_card(name, d, extra_html=""):
-        ch = d.get("change_pct", 0)
-        style = market_change_style(ch)
-        return f"""
-        <td style="padding:5px">
-          <div style="background:#fff;border:1px solid #e8e8e8;border-radius:10px;padding:13px 14px;min-width:120px">
-            <p style="margin:0 0 6px;font-size:11px;color:#666;line-height:1.3">{name}</p>
-            <p style="margin:0 0 7px;font-size:19px;font-weight:600;color:#1a1a1a;line-height:1">{d['price']}</p>
-            <span style="display:inline-block;padding:2px 7px;border-radius:20px;font-size:11px;font-weight:600;{style}">
-              {d['arrow']} {d['change_label']}
-            </span>
-            {extra_html}
-          </div>
-        </td>"""
-
-    def fg_card(name, data):
-        score = data.get("score")
-        label = data.get("label", "N/A")
-        color = fear_greed_color(score)
-        pct = score if score else 0
-        score_str = str(score) if score is not None else "—"
-        bar_html = f"""
-        <div style="margin-top:8px">
-          <div style="height:4px;background:#eee;border-radius:2px;overflow:hidden">
-            <div style="height:100%;width:{pct}%;background:{color};border-radius:2px"></div>
-          </div>
-          <p style="margin:4px 0 0;font-size:10px;color:{color};font-weight:600">{label} · {score_str}/100</p>
-        </div>"""
-        d = {"price": score_str, "change_pct": 0, "change_label": "", "arrow": ""}
-        return metric_card(name, d, bar_html)
-
-    def cpi_card():
-        yoy_val = cpi.get("yoy", "N/A")
-        date_val = cpi.get("date", "")
-        try:
-            yoy_float = float(yoy_val.replace("%",""))
-            ch_style = market_change_style(yoy_float)
-            arrow = "▲" if yoy_float > 0 else "▼"
-        except:
-            ch_style = "color:#5F5E5A;background:#F1EFE8"
-            arrow = "—"
-        d = {"price": yoy_val, "change_pct": 0, "change_label": f"YoY · {date_val}", "arrow": arrow}
-        return metric_card("US CPI (YoY)", d)
-
-    # ── Must Know section ──
-    must_know_rows = ""
-    for item in must_know.get("items", []):
-        try:
-            url_str = f'<a href="{item["url"]}" style="font-size:11px;color:#999;text-decoration:none">source ↗</a>' if item.get("url") else ""
-            must_know_rows += f"""
-        <tr><td style="padding:12px 16px;border-bottom:1px solid #f0f0f0">
-          <table width="100%" cellpadding="0" cellspacing="0">
-            <tr><td>{cat_pill(item.get('category',''))}</td><td align="right">{url_str}</td></tr>
-            <tr><td colspan="2" style="padding-top:6px;font-size:14px;font-weight:600;color:#1a1a1a;line-height:1.4">{item.get('headline','')}</td></tr>
-            <tr><td colspan="2" style="padding-top:4px;font-size:13px;color:#555;line-height:1.55">{item.get('detail','')}</td></tr>
-          </table>
-        </td></tr>"""
-        except Exception as e:
-            print(f"⚠️ Skipping must-know item: {e}")
-
-    # ── Tracked Topics section ──
-    topic_rows = ""
+    # Topics
+    topics_out = []
     for topic in TOPICS:
-        try:
-            items = topic_news.get(topic, [])
-            if not items:
-                continue
-            b = sum(1 for i in items if i.get("sentiment") == "bullish")
-            r = sum(1 for i in items if i.get("sentiment") == "bearish")
-            overall = "bullish" if b > r else ("bearish" if r > b else "neutral")
-            bullets = ""
-            for item in items:
-                try:
-                    s = item.get("sentiment", "neutral")
-                    _, col, dot = SENTIMENT_COLORS.get(s, ("#F1EFE8","#5F5E5A","#888"))
-                    url_str = f' <a href="{item["url"]}" style="font-size:11px;color:#aaa;text-decoration:none">↗</a>' if item.get("url") else ""
-                    bullets += f"""
-                <tr><td style="padding:8px 0;border-bottom:1px solid #f5f5f5;vertical-align:top">
-                  <table cellpadding="0" cellspacing="0"><tr>
-                    <td style="padding-top:5px;width:14px"><span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:{dot}"></span></td>
-                    <td style="font-size:13px;color:#333;line-height:1.55;padding-left:4px">{item.get('text','')}{url_str}</td>
-                  </tr></table>
-                </td></tr>"""
-                except Exception as e:
-                    print(f"⚠️ Skipping bullet for {topic}: {e}")
-            topic_rows += f"""
-        <tr><td style="padding:14px 0 6px">
-          <table width="100%" cellpadding="0" cellspacing="0">
-            <tr>
-              <td style="font-size:15px;font-weight:600;color:#1a1a1a">{topic}</td>
-              <td align="right">{sentiment_pill(overall)}</td>
-            </tr>
-          </table>
-          <table width="100%" cellpadding="0" cellspacing="0" style="margin-top:4px">{bullets}</table>
-        </td></tr>
-        <tr><td style="height:1px;background:#eeeeee"></td></tr>"""
-        except Exception as e:
-            print(f"⚠️ Skipping topic {topic}: {e}")
+        items = topic_news.get(topic, [])
+        b = sum(1 for i in items if i.get("sentiment") == "bullish")
+        r = sum(1 for i in items if i.get("sentiment") == "bearish")
+        overall = "bullish" if b > r else ("bearish" if r > b else "neutral")
+        topics_out.append({"name": topic, "overall": overall, "items": items})
 
-    # ── Market rows ──
-    equity_cards = "".join(metric_card(n, market_data[n]) for n in ["S&P 500","Nasdaq 100","Nikkei 225","Hang Seng","DAX"] if n in market_data)
-    commodity_cards = "".join(metric_card(n, market_data[n]) for n in ["WTI Crude Oil","Natural Gas","Gold","Silver"] if n in market_data)
-    macro_cards = (
-        (metric_card("VIX", market_data["VIX"]) if "VIX" in market_data else "") +
-        (metric_card("DXY Dollar Index", market_data["DXY Dollar Index"]) if "DXY Dollar Index" in market_data else "") +
-        fg_card("CNN Fear & Greed", fg) +
-        fg_card("Crypto Fear & Greed", cfg) +
-        cpi_card()
+    return {
+        "secret": WEBHOOK_SECRET,
+        "date": today_str,
+        "generated_at": now_taipei,
+        "must_know": must_know,
+        "market": {"equity": equity, "commodities": commodities, "macro": macro},
+        "topics": topics_out
+    }
+
+
+# ── 4. POST to Google Sheets webhook ─────────────────────────────────────────
+def post_to_sheets(payload, webhook_url):
+    print("📊 Posting to Google Sheets...")
+    resp = requests.post(
+        webhook_url,
+        json=payload,
+        timeout=60
     )
-
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Daily Market Brief · {today_str}</title></head>
-<body style="margin:0;padding:0;background:#f4f4f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
-<table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f0;padding:24px 0">
-<tr><td align="center">
-<table width="640" cellpadding="0" cellspacing="0" style="max-width:640px;width:100%">
-
-  <!-- Header -->
-  <tr><td style="background:#1a1a1a;border-radius:12px 12px 0 0;padding:22px 28px">
-    <table width="100%" cellpadding="0" cellspacing="0"><tr>
-      <td><p style="margin:0;font-size:20px;font-weight:700;color:#fff">Daily Market Brief</p>
-          <p style="margin:4px 0 0;font-size:12px;color:#aaa">{today_str} · Generated {now_taipei}</p></td>
-      <td align="right"><p style="margin:0;font-size:11px;color:#666">13 topics tracked</p></td>
-    </tr></table>
-  </td></tr>
-
-  <!-- Body -->
-  <tr><td style="background:#ffffff;padding:0 28px 28px;border-radius:0 0 12px 12px">
-    <table width="100%" cellpadding="0" cellspacing="0">
-
-      <!-- MUST KNOW -->
-      {section_header("Must Know Today", "#E24B4A")}
-      <tr><td style="padding:4px 0 8px;font-size:13px;color:#555;font-style:italic;line-height:1.65">
-        {must_know.get('summary','')}
-      </td></tr>
-      <tr><td>
-        <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #eee;border-radius:10px;overflow:hidden">
-          {must_know_rows}
-        </table>
-      </td></tr>
-
-      <!-- MARKET DASHBOARD -->
-      {section_header("Market Dashboard", "#378ADD")}
-
-      <tr><td style="padding:0 0 6px;font-size:12px;color:#999;font-weight:600;letter-spacing:.03em">EQUITY INDICES</td></tr>
-      <tr><td><table cellpadding="0" cellspacing="0"><tr>{equity_cards}</tr></table></td></tr>
-
-      <tr><td style="padding:14px 0 6px;font-size:12px;color:#999;font-weight:600;letter-spacing:.03em">COMMODITIES</td></tr>
-      <tr><td><table cellpadding="0" cellspacing="0"><tr>{commodity_cards}</tr></table></td></tr>
-
-      <tr><td style="padding:14px 0 6px;font-size:12px;color:#999;font-weight:600;letter-spacing:.03em">MACRO & SENTIMENT</td></tr>
-      <tr><td><table cellpadding="0" cellspacing="0"><tr>{macro_cards}</tr></table></td></tr>
-
-      <!-- TRACKED TOPICS -->
-      {section_header("Tracked Topics", "#639922")}
-      {topic_rows}
-
-    </table>
-  </td></tr>
-
-  <!-- Footer -->
-  <tr><td style="padding:16px 0;text-align:center">
-    <p style="margin:0;font-size:11px;color:#aaa">
-      Sources: Anthropic Web Search · Yahoo Finance · CNN · Alternative.me · FRED<br>
-      Generated automatically for personal use · Not financial advice
-    </p>
-  </td></tr>
-
-</table>
-</td></tr>
-</table>
-</body></html>"""
-    return html
-
-
-# ── 4. Send email ─────────────────────────────────────────────────────────────
-def send_email(html, subject, to_addr, from_addr, app_password):
-    print(f"📧 Connecting to smtp.gmail.com:465...")
-    print(f"📧 From: {from_addr} To: {to_addr}")
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"]    = from_addr
-        msg["To"]      = to_addr
-        msg.attach(MIMEText(html, "html"))
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            print("📧 Connected. Logging in...")
-            server.login(from_addr, app_password)
-            print("📧 Logged in. Sending...")
-            server.sendmail(from_addr, to_addr, msg.as_string())
-        print(f"✅ Email sent to {to_addr}")
-    except smtplib.SMTPAuthenticationError as e:
-        print(f"❌ Gmail auth failed: {e}")
-        print("❌ Check GMAIL_APP_PASSWORD — must be 16 chars, no spaces")
-        raise
-    except smtplib.SMTPException as e:
-        print(f"❌ SMTP error: {e}")
-        raise
-    except Exception as e:
-        print(f"❌ Email send failed: {type(e).__name__}: {e}")
-        raise
+    if resp.status_code == 200:
+        result = resp.json()
+        if result.get("status") == "ok":
+            print(f"✅ Google Sheet updated! Rows written: {result.get('rows')}")
+        else:
+            print(f"⚠️ Apps Script error: {result.get('message')}")
+    else:
+        print(f"❌ Webhook failed: {resp.status_code} {resp.text}")
+        raise Exception(f"Webhook failed: {resp.status_code}")
 
 
 # ── 5. Main ───────────────────────────────────────────────────────────────────
 def main():
     now = datetime.now(TAIPEI_TZ)
     today_str = now.strftime("%A, %B %-d, %Y")
+    now_taipei = now.strftime("%I:%M %p TPE")
     print(f"🚀 Running Daily Brief for {today_str}")
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=120.0)
@@ -512,20 +298,19 @@ def main():
         print(f"⚠️ Must-know failed: {e}")
         must_know = {"summary": "Could not fetch global news today.", "items": []}
 
-    print("📰 Fetching topic news (batch 1/3)...")
+    print("📰 Fetching topic news...")
     try:
         topic_news = fetch_topic_news(client, today_str)
     except Exception as e:
         print(f"⚠️ Topic news failed: {e}")
         topic_news = {}
 
-    print("✉️  Building and sending email...")
+    print("📊 Building payload and posting to Google Sheets...")
     try:
-        html = build_html(today_str, must_know, topic_news, market_data, fg, cfg, cpi)
-        subject = f"📊 Daily Brief · {now.strftime('%b %-d, %Y')}"
-        send_email(html, subject, TO_EMAIL, GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+        payload = build_payload(today_str, now_taipei, must_know, topic_news, market_data, fg, cfg, cpi)
+        post_to_sheets(payload, SHEETS_WEBHOOK_URL)
     except Exception as e:
-        print(f"❌ Email failed: {type(e).__name__}: {e}")
+        print(f"❌ Google Sheets post failed: {type(e).__name__}: {e}")
         raise
 
     print("✅ Done!")
@@ -533,3 +318,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
