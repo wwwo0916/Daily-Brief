@@ -4,7 +4,6 @@ Runs every morning, fetches live data via Anthropic API, sends HTML email.
 """
 
 import anthropic
-import yfinance as yf
 import requests
 import smtplib
 import json
@@ -26,57 +25,49 @@ TOPICS = [
     "DeFi & Stablecoin", "Crypto Regulation"
 ]
 
-# ── Market symbols ────────────────────────────────────────────────────────────
-MARKET_SYMBOLS = {
-    "S&P 500":          "^GSPC",
-    "Nasdaq 100":       "^NDX",
-    "Nikkei 225":       "^N225",
-    "Hang Seng":        "^HSI",
-    "DAX":              "^GDAXI",
-    "WTI Crude Oil":    "CL=F",
-    "Natural Gas":      "NG=F",
-    "Gold":             "GC=F",
-    "Silver":           "SI=F",
-    "VIX":              "^VIX",
-    "DXY Dollar Index": "DX=F",
-}
-
 TAIPEI_TZ = timezone(timedelta(hours=8))
 
 
 # ── 1. Fetch market data via yfinance ─────────────────────────────────────────
 def fetch_market_data():
+    """Fetch via Yahoo Finance query API directly — no yfinance dependency."""
+    SYMBOLS = {
+        "S&P 500":          ("^GSPC",  lambda v: f"{v:,.2f}",  ""),
+        "Nasdaq 100":       ("^NDX",   lambda v: f"{v:,.2f}",  ""),
+        "Nikkei 225":       ("^N225",  lambda v: f"{v:,.2f}",  ""),
+        "Hang Seng":        ("^HSI",   lambda v: f"{v:,.2f}",  ""),
+        "DAX":              ("^GDAXI", lambda v: f"{v:,.2f}",  ""),
+        "WTI Crude Oil":    ("CL=F",   lambda v: f"${v:.2f}",  "per barrel"),
+        "Natural Gas":      ("NG=F",   lambda v: f"${v:.3f}",  "Henry Hub"),
+        "Gold":             ("GC=F",   lambda v: f"${v:,.0f}", "per oz"),
+        "Silver":           ("SI=F",   lambda v: f"${v:.2f}",  "per oz"),
+        "VIX":              ("^VIX",   lambda v: f"{v:.2f}",   ">20 = elevated"),
+        "DXY Dollar Index": ("DX=F",   lambda v: f"{v:.2f}",   ""),
+    }
     results = {}
-    for name, sym in MARKET_SYMBOLS.items():
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for name, (sym, fmt, note) in SYMBOLS.items():
         try:
-            ticker = yf.Ticker(sym)
-            hist = ticker.history(period="2d")
-            if len(hist) >= 2:
-                prev_close = hist["Close"].iloc[-2]
-                last_close = hist["Close"].iloc[-1]
-            elif len(hist) == 1:
-                prev_close = hist["Close"].iloc[0]
-                last_close = prev_close
-            else:
-                raise ValueError("No data")
-            change_pct = ((last_close - prev_close) / prev_close) * 100
-            sign = "+" if change_pct >= 0 else ""
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=5d"
+            r = requests.get(url, headers=headers, timeout=15)
+            data = r.json()
+            meta = data["chart"]["result"][0]["meta"]
+            price = meta.get("regularMarketPrice") or meta.get("previousClose", 0)
+            prev  = meta.get("chartPreviousClose") or meta.get("previousClose", price)
+            change_pct = ((price - prev) / prev * 100) if prev else 0
+            sign  = "+" if change_pct >= 0 else ""
             arrow = "▲" if change_pct > 0 else ("▼" if change_pct < 0 else "—")
-            # Format price nicely
-            if name in ("WTI Crude Oil", "Natural Gas", "Gold", "Silver"):
-                price_str = f"${last_close:,.2f}"
-            elif name in ("VIX", "DXY Dollar Index"):
-                price_str = f"{last_close:.2f}"
-            else:
-                price_str = f"{last_close:,.2f}"
             results[name] = {
-                "price": price_str,
+                "price": fmt(price),
                 "change_pct": change_pct,
                 "change_label": f"{sign}{change_pct:.2f}%",
                 "arrow": arrow,
+                "note": note,
             }
+            print(f"  ✓ {name}: {fmt(price)} ({sign}{change_pct:.2f}%)")
         except Exception as e:
-            results[name] = {"price": "N/A", "change_pct": 0, "change_label": "—", "arrow": "—"}
+            print(f"  ✗ {name}: {e}")
+            results[name] = {"price": "N/A", "change_pct": 0, "change_label": "—", "arrow": "—", "note": note}
     return results
 
 
@@ -125,6 +116,7 @@ def fetch_us_cpi():
 
 # ── 2. Fetch news via Anthropic API with web search ───────────────────────────
 def fetch_must_know(client, today_str):
+    print("🌍 Fetching must-know headlines...")
     prompt = f"""Today is {today_str}. Search for the top 5 must-know global news stories for investors today.
 Focus on: macro-economic events, geopolitical developments, central bank decisions, trade policy.
 Exclude: Nvidia, AMD, Google, Tesla, TSMC, Bitcoin, Ethereum, crypto, DeFi (those are covered separately).
@@ -137,47 +129,65 @@ Respond ONLY with a JSON array, no markdown:
         model="claude-sonnet-4-5",
         max_tokens=1200,
         tools=[{"type": "web_search_20250305", "name": "web_search"}],
-        messages=[{"role": "user", "content": prompt}]
+        messages=[{"role": "user", "content": prompt}],
+        timeout=90,
     )
     text = "".join(b.text for b in message.content if hasattr(b, "text"))
     text = text.replace("```json", "").replace("```", "").strip()
     start, end = text.find("["), text.rfind("]")
     items = json.loads(text[start:end+1])
+    print(f"✅ Got {len(items)} must-know items")
     # One-line summary
-    summary_prompt = f"In 2-3 neutral sentences, summarize the macro/geopolitical backdrop for investors today based on these headlines: {json.dumps([i['headline'] for i in items])}"
     summary_msg = client.messages.create(
         model="claude-sonnet-4-5",
         max_tokens=200,
-        messages=[{"role": "user", "content": summary_prompt}]
+        messages=[{"role": "user", "content": f"In 2-3 neutral sentences, summarize the macro/geopolitical backdrop for investors today based on: {json.dumps([i['headline'] for i in items])}"}],
+        timeout=30,
     )
     summary = summary_msg.content[0].text.strip()
     return {"summary": summary, "items": items}
 
 
 def fetch_topic_news(client, today_str):
-    """Fetch news for all tracked topics in one API call."""
-    topics_str = ", ".join(TOPICS)
-    prompt = f"""Today is {today_str}. Search for the latest news (last 24h) for each of these topics: {topics_str}.
+    """Fetch news in 3 batches of ~4 topics to avoid timeout."""
+    BATCHES = [
+        ["Nvidia", "AMD", "Google", "TSMC"],
+        ["Tesla Motors", "Tesla Energy", "Tesla Robotics", "Bitcoin"],
+        ["Ethereum", "Cardano", "RWA (Real World Assets)", "DeFi & Stablecoin", "Crypto Regulation"],
+    ]
+    all_results = {}
+    for batch in BATCHES:
+        topics_str = ", ".join(batch)
+        prompt = f"""Today is {today_str}. Search for the latest news (last 24h) for these topics: {topics_str}.
 
-For each topic return 2-4 bullet points. Each bullet must be tagged [BULLISH], [BEARISH], or [NEUTRAL].
+For each topic return 2-3 bullet points tagged [BULLISH], [BEARISH], or [NEUTRAL].
+If no news found for a topic, return one NEUTRAL bullet saying so.
 
-Respond ONLY with a JSON object, no markdown:
+Respond ONLY with a JSON object, no markdown, no extra text:
 {{
-  "Nvidia": [
-    {{"sentiment": "bullish", "text": "...", "url": "source URL or null"}}
-  ],
+  "{batch[0]}": [{{"sentiment": "bullish", "text": "...", "url": "URL or null"}}],
   ...
 }}"""
-    message = client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=4000,
-        tools=[{"type": "web_search_20250305", "name": "web_search"}],
-        messages=[{"role": "user", "content": prompt}]
-    )
-    text = "".join(b.text for b in message.content if hasattr(b, "text"))
-    text = text.replace("```json", "").replace("```", "").strip()
-    start, end = text.find("{"), text.rfind("}")
-    return json.loads(text[start:end+1])
+        try:
+            message = client.messages.create(
+                model="claude-sonnet-4-5",
+                max_tokens=2000,
+                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                messages=[{"role": "user", "content": prompt}],
+                timeout=120,
+            )
+            text = "".join(b.text for b in message.content if hasattr(b, "text"))
+            text = text.replace("```json", "").replace("```", "").strip()
+            start, end = text.find("{"), text.rfind("}")
+            if start != -1 and end != -1:
+                batch_data = json.loads(text[start:end+1])
+                all_results.update(batch_data)
+                print(f"✅ Batch done: {batch}")
+        except Exception as e:
+            print(f"⚠️ Batch failed ({batch}): {e}")
+            for topic in batch:
+                all_results[topic] = [{"sentiment": "neutral", "text": "Could not fetch news for this topic.", "url": None}]
+    return all_results
 
 
 # ── 3. Build HTML email ───────────────────────────────────────────────────────
