@@ -1,1 +1,1 @@
-worker: python brief.py
+worker: python3.11 brief.py
