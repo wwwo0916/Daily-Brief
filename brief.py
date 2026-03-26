@@ -131,9 +131,11 @@ Respond ONLY with a JSON array, no markdown:
 [
   {{"headline": "short headline", "detail": "one neutral factual sentence", "category": "Macro|Geopolitics|Trade|Energy|Finance|Policy", "url": "source URL or null"}}
 ]"""
+    print("⏳ Waiting 65s before must-know fetch...")
+    time.sleep(65)
     try:
         message = client.messages.create(
-            model="claude-sonnet-4-5",
+            model="claude-haiku-4-5-20251001",
             max_tokens=1200,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{"role": "user", "content": prompt}],
@@ -148,7 +150,7 @@ Respond ONLY with a JSON array, no markdown:
     print(f"✅ Got {len(items)} must-know items")
     # One-line summary
     summary_msg = client.messages.create(
-        model="claude-sonnet-4-5",
+        model="claude-haiku-4-5-20251001",
         max_tokens=200,
         messages=[{"role": "user", "content": f"In 2-3 neutral sentences, summarize the macro/geopolitical backdrop for investors today based on: {json.dumps([i['headline'] for i in items])}"}],
     )
@@ -181,7 +183,7 @@ Respond ONLY with a JSON object, no markdown, no extra text:
 }}"""
         try:
             message = client.messages.create(
-                model="claude-sonnet-4-5",
+                model="claude-haiku-4-5-20251001",
                 max_tokens=2000,
                 tools=[{"type": "web_search_20250305", "name": "web_search"}],
                 messages=[{"role": "user", "content": prompt}],
@@ -496,9 +498,13 @@ def main():
         topic_news = {}
 
     print("✉️  Building and sending email...")
-    html = build_html(today_str, must_know, topic_news, market_data, fg, cfg, cpi)
-    subject = f"📊 Daily Brief · {now.strftime('%b %-d, %Y')}"
-    send_email(html, subject, TO_EMAIL, GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+    try:
+        html = build_html(today_str, must_know, topic_news, market_data, fg, cfg, cpi)
+        subject = f"📊 Daily Brief · {now.strftime('%b %-d, %Y')}"
+        send_email(html, subject, TO_EMAIL, GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+    except Exception as e:
+        print(f"❌ Email failed: {type(e).__name__}: {e}")
+        raise
 
     print("✅ Done!")
 
