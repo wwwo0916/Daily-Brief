@@ -21,7 +21,7 @@ TO_EMAIL          = os.environ["TO_EMAIL"]           # who receives the brief (c
 
 # ── Tracked topics ────────────────────────────────────────────────────────────
 TOPICS = [
-    "Nvidia", "AMD", "Google", "Tesla Motors", "Tesla Energy", "Tesla Robotics",
+    "Nvidia", "AMD", "Google", "Tesla (Motors, Energy & Robotics)",
     "TSMC", "Bitcoin", "Ethereum", "Cardano", "RWA (Real World Assets)",
     "DeFi & Stablecoin", "Crypto Regulation"
 ]
@@ -131,12 +131,12 @@ Respond ONLY with a JSON array, no markdown:
 [
   {{"headline": "short headline", "detail": "one neutral factual sentence", "category": "Macro|Geopolitics|Trade|Energy|Finance|Policy", "url": "source URL or null"}}
 ]"""
-    print("⏳ Waiting 65s before must-know fetch...")
-    time.sleep(65)
+    print("⏳ Waiting 30s before must-know fetch...")
+    time.sleep(30)
     try:
         message = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=1200,
+            max_tokens=800,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=[{"role": "user", "content": prompt}],
         )
@@ -161,15 +161,14 @@ Respond ONLY with a JSON array, no markdown:
 def fetch_topic_news(client, today_str):
     """Fetch news in 3 batches of ~4 topics to avoid timeout."""
     BATCHES = [
-        ["Nvidia", "AMD", "Google", "TSMC"],
-        ["Tesla Motors", "Tesla Energy", "Tesla Robotics", "Bitcoin"],
-        ["Ethereum", "Cardano", "RWA (Real World Assets)", "DeFi & Stablecoin", "Crypto Regulation"],
+        ["Nvidia", "AMD", "Google", "Tesla (Motors, Energy & Robotics)", "TSMC"],
+        ["Bitcoin", "Ethereum", "Cardano", "RWA (Real World Assets)", "DeFi & Stablecoin", "Crypto Regulation"],
     ]
     all_results = {}
     for i, batch in enumerate(BATCHES):
         if i > 0:
-            print(f"⏳ Waiting 65s before batch {i+1} to respect rate limits...")
-            time.sleep(65)
+            print(f"⏳ Waiting 15s before batch {i+1}...")
+            time.sleep(15)
         topics_str = ", ".join(batch)
         prompt = f"""Today is {today_str}. Search for the latest news (last 24h) for these topics: {topics_str}.
 
@@ -184,8 +183,7 @@ Respond ONLY with a JSON object, no markdown, no extra text:
         try:
             message = client.messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=2000,
-                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                max_tokens=1200,
                 messages=[{"role": "user", "content": prompt}],
             )
             text = "".join(b.text for b in message.content if hasattr(b, "text"))
@@ -448,15 +446,30 @@ def build_html(today_str, must_know, topic_news, market_data, fg, cfg, cpi):
 
 # ── 4. Send email ─────────────────────────────────────────────────────────────
 def send_email(html, subject, to_addr, from_addr, app_password):
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"]    = from_addr
-    msg["To"]      = to_addr
-    msg.attach(MIMEText(html, "html"))
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(from_addr, app_password)
-        server.sendmail(from_addr, to_addr, msg.as_string())
-    print(f"✅ Email sent to {to_addr}")
+    print(f"📧 Connecting to smtp.gmail.com:465...")
+    print(f"📧 From: {from_addr} To: {to_addr}")
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = from_addr
+        msg["To"]      = to_addr
+        msg.attach(MIMEText(html, "html"))
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            print("📧 Connected. Logging in...")
+            server.login(from_addr, app_password)
+            print("📧 Logged in. Sending...")
+            server.sendmail(from_addr, to_addr, msg.as_string())
+        print(f"✅ Email sent to {to_addr}")
+    except smtplib.SMTPAuthenticationError as e:
+        print(f"❌ Gmail auth failed: {e}")
+        print("❌ Check GMAIL_APP_PASSWORD — must be 16 chars, no spaces")
+        raise
+    except smtplib.SMTPException as e:
+        print(f"❌ SMTP error: {e}")
+        raise
+    except Exception as e:
+        print(f"❌ Email send failed: {type(e).__name__}: {e}")
+        raise
 
 
 # ── 5. Main ───────────────────────────────────────────────────────────────────
