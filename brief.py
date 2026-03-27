@@ -1,12 +1,10 @@
 """
 Daily Market Brief
-- Reads topic config (keywords, active flags) from Google Sheet "Config" tab
-- Fetches market data + news via Anthropic web search
-- Writes results to a dated Google Sheet tab
-- Optionally sends HTML email via Resend
+- Reads topic config from Google Sheet "Config" tab
+- Fetches market data + news (Anthropic / OpenAI / Gemini — switchable)
+- Writes to Google Sheet + sends email via Resend
 """
 
-import anthropic
 import requests
 import json
 import os
@@ -15,29 +13,63 @@ import time
 from datetime import datetime, timezone, timedelta
 
 # ── Config ────────────────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
+ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
+OPENAI_API_KEY     = os.environ.get("OPENAI_API_KEY", "")
+GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "")
+AI_PROVIDER        = os.environ.get("AI_PROVIDER", "anthropic").lower()
+
 SHEETS_WEBHOOK_URL = os.environ["SHEETS_WEBHOOK_URL"]
 WEBHOOK_SECRET     = os.environ["WEBHOOK_SECRET"]
-RESEND_API_KEY     = os.environ.get("RESEND_API_KEY", "")
-TO_EMAIL           = os.environ.get("TO_EMAIL", "")
+TO_EMAIL           = os.environ.get("TO_EMAIL", "")  # Gmail address to receive the brief
 
 TAIPEI_TZ = timezone(timedelta(hours=8))
 
+# ── AI provider abstraction ───────────────────────────────────────────────────
+def ai_call(prompt, use_search=False, max_tokens=800):
+    """Unified AI call — switches provider based on AI_PROVIDER env var."""
+
+    if AI_PROVIDER == "openai":
+        import openai
+        client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        tools = [{"type": "web_search_preview"}] if use_search else []
+        kwargs = dict(model="gpt-4o-mini", max_output_tokens=max_tokens,
+                      input=[{"role":"user","content":prompt}])
+        if tools: kwargs["tools"] = tools
+        resp = client.responses.create(**kwargs)
+        return resp.output_text
+
+    elif AI_PROVIDER == "gemini":
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+        tools = [{"google_search": {}}] if use_search else []
+        body = {"contents": [{"parts": [{"text": prompt}]}]}
+        if tools: body["tools"] = tools
+        resp = requests.post(url, json=body, timeout=120)
+        resp.raise_for_status()
+        return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+    else:  # anthropic (default)
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=120.0)
+        kwargs = dict(model="claude-haiku-4-5-20251001", max_tokens=max_tokens,
+                      messages=[{"role":"user","content":prompt}])
+        if use_search:
+            kwargs["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
+        msg = client.messages.create(**kwargs)
+        return "".join(b.text for b in msg.content if hasattr(b, "text"))
+
 
 def clean_text(text):
-    """Strip citation tags and stray HTML from API responses."""
-    if not text:
-        return text
+    """Strip citation tags and stray HTML."""
+    if not text: return text
     text = re.sub(r'<cite[^>]*>(.*?)</cite>', r'\1', text, flags=re.DOTALL)
     text = re.sub(r'<[^>]+>', '', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
 
-# ── 1. Read topic config from Google Sheet ────────────────────────────────────
+# ── 1. Read config from Google Sheet ─────────────────────────────────────────
 def fetch_config():
-    """GET /exec?action=get_config&secret=... → list of {topic, keywords, active}"""
-    print("📋 Reading topic config from Google Sheet...")
+    print(f"📋 Reading config from Google Sheet (AI provider: {AI_PROVIDER})...")
     url = f"{SHEETS_WEBHOOK_URL}?action=get_config&secret={WEBHOOK_SECRET}"
     try:
         r = requests.get(url, timeout=15)
@@ -45,22 +77,24 @@ def fetch_config():
         if data.get("status") != "ok":
             raise ValueError(data.get("message", "Unknown error"))
         topics = [t for t in data["topics"] if t.get("active")]
-        print(f"✅ Loaded {len(topics)} active topics from Config sheet")
+        print(f"✅ Loaded {len(topics)} active topics from Config tab")
         return topics
     except Exception as e:
-        print(f"⚠️ Could not read config: {e} — using hardcoded defaults")
+        print(f"⚠️ Could not read Config tab: {e} — using hardcoded defaults")
         return [
-            {"topic": "Nvidia",         "keywords": '"Jensen Huang" OR "Blackwell"'},
-            {"topic": "AMD",            "keywords": '"Lisa Su" OR "Ryzen AI"'},
-            {"topic": "Google",         "keywords": '"Gemini" OR "DeepMind"'},
-            {"topic": "Tesla (Motors, Energy & Robotics)", "keywords": '"Robotaxi" OR "Optimus" OR "Megapack"'},
-            {"topic": "TSMC",           "keywords": '"C.C. Wei" OR "2nm" OR "CoWoS"'},
-            {"topic": "Bitcoin",        "keywords": '"Bitcoin" OR "BTC ETF"'},
-            {"topic": "Ethereum",       "keywords": '"Pectra" OR "Ethereum"'},
-            {"topic": "Cardano",        "keywords": '"Hoskinson" OR "Cardano"'},
-            {"topic": "RWA (Real World Assets)", "keywords": '"BlackRock" OR "Tokenized"'},
-            {"topic": "DeFi & Stablecoin", "keywords": '"Uniswap" OR "Aave" OR "USDC"'},
-            {"topic": "Crypto Regulation", "keywords": '"Paul Atkins" OR "CFTC"'},
+            {"topic": t, "keywords": k} for t, k in {
+                "Nvidia": '"Jensen Huang" OR "Blackwell" OR "Rubin"',
+                "AMD": '"Lisa Su" OR "Ryzen AI" OR "Zen 6"',
+                "Google": '"Gemini" OR "DeepMind" OR "Antitrust"',
+                "Tesla (Motors, Energy & Robotics)": '"Cybercab" OR "Robotaxi" OR "FSD" OR "Optimus" OR "Megapack"',
+                "TSMC": '"C.C. Wei" OR "2nm" OR "CoWoS" OR "Arizona"',
+                "Bitcoin": '"OP_CAT" OR "BitVM" OR "ETF" OR "Bitcoin price"',
+                "Ethereum": '"Pectra" OR "PeerDAS" OR "Blob" OR "Ethereum upgrade"',
+                "Cardano": '"Hoskinson" OR "Leios" OR "Midnight" OR "Chang"',
+                "RWA (Real World Assets)": '"BlackRock" OR "Ondo" OR "Securitize" OR "Tokenized Treasuries"',
+                "DeFi & Stablecoin": '"Uniswap" OR "Aave" OR "USDC" OR "Restaking"',
+                "Crypto Regulation": '"Paul Atkins" OR "Clarity Act" OR "SAB 121" OR "CFTC"',
+            }.items()
         ]
 
 
@@ -83,25 +117,17 @@ def fetch_market_data():
     headers = {"User-Agent": "Mozilla/5.0"}
     for name, (sym, fmt, note) in SYMBOLS.items():
         try:
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=5d"
-            r = requests.get(url, headers=headers, timeout=15)
-            data = r.json()
-            result = data.get("chart", {}).get("result")
-            if not result:
-                raise ValueError("No result")
-            meta  = result[0].get("meta", {})
+            r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=5d",
+                             headers=headers, timeout=15)
+            meta = r.json()["chart"]["result"][0]["meta"]
             price = meta.get("regularMarketPrice") or meta.get("previousClose")
-            if not price:
-                raise ValueError("No price")
+            if not price: raise ValueError("No price")
             prev  = meta.get("chartPreviousClose") or meta.get("previousClose") or price
             pct   = ((price - prev) / prev * 100) if prev else 0
             sign  = "+" if pct >= 0 else ""
-            results[name] = {
-                "price": fmt(price), "change_pct": pct,
-                "change_label": f"{sign}{pct:.2f}%",
-                "arrow": "▲" if pct > 0 else ("▼" if pct < 0 else "—"),
-                "note": note,
-            }
+            results[name] = {"price": fmt(price), "change_pct": pct,
+                             "change_label": f"{sign}{pct:.2f}%",
+                             "arrow": "▲" if pct>0 else ("▼" if pct<0 else "—"), "note": note}
             print(f"  ✓ {name}: {fmt(price)} ({sign}{pct:.2f}%)")
         except Exception as e:
             print(f"  ✗ {name}: {e}")
@@ -111,73 +137,55 @@ def fetch_market_data():
 
 def fetch_fear_greed():
     try:
-        r = requests.get("https://production.dataviz.cnn.io/index/fearandgreed/graphdata", timeout=10)
-        d = r.json()
-        return {"score": round(d["fear_and_greed"]["score"]), "label": d["fear_and_greed"]["rating"].replace("_"," ").title()}
-    except:
-        return {"score": None, "label": "Unavailable"}
-
+        d = requests.get("https://production.dataviz.cnn.io/index/fearandgreed/graphdata",timeout=10).json()
+        return {"score":round(d["fear_and_greed"]["score"]),"label":d["fear_and_greed"]["rating"].replace("_"," ").title()}
+    except: return {"score":None,"label":"Unavailable"}
 
 def fetch_crypto_fear_greed():
     try:
-        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
-        d = r.json()
-        return {"score": int(d["data"][0]["value"]), "label": d["data"][0]["value_classification"]}
-    except:
-        return {"score": None, "label": "Unavailable"}
-
+        d = requests.get("https://api.alternative.me/fng/?limit=1",timeout=10).json()
+        return {"score":int(d["data"][0]["value"]),"label":d["data"][0]["value_classification"]}
+    except: return {"score":None,"label":"Unavailable"}
 
 def fetch_us_cpi():
     try:
-        r = requests.get("https://fred.stlouisfed.org/graph/fredgraph.csv?id=CPIAUCSL", timeout=10)
-        lines = r.text.strip().split("\n")
-        last  = lines[-1].split(",")
-        prev  = lines[-13].split(",")
-        yoy   = ((float(last[1]) - float(prev[1])) / float(prev[1])) * 100
-        return {"value": f"{float(last[1]):.1f}", "yoy": f"{yoy:.1f}%", "date": last[0]}
-    except:
-        return {"value":"N/A","yoy":"N/A","date":"N/A"}
+        lines = requests.get("https://fred.stlouisfed.org/graph/fredgraph.csv?id=CPIAUCSL",timeout=10).text.strip().split("\n")
+        last,prev = lines[-1].split(","), lines[-13].split(",")
+        yoy = ((float(last[1])-float(prev[1]))/float(prev[1]))*100
+        return {"value":f"{float(last[1]):.1f}","yoy":f"{yoy:.1f}%","date":last[0]}
+    except: return {"value":"N/A","yoy":"N/A","date":"N/A"}
 
 
-# ── 3. News via Anthropic ─────────────────────────────────────────────────────
-def fetch_must_know(client, today_str):
+# ── 3. News ───────────────────────────────────────────────────────────────────
+def fetch_must_know(today_str):
     print("🌍 Fetching must-know headlines...")
-    prompt = f"""Today is {today_str}. Search for the top 5 must-know global news stories for investors today.
-Focus on: macro-economic events, geopolitical developments, central bank decisions, trade policy.
+    prompt = f"""Today is {today_str}. Search for the top 5 must-know global news stories for investors.
+Focus on: macro-economic events, geopolitics, central bank decisions, trade policy.
 Exclude: Nvidia, AMD, Google, Tesla, TSMC, Bitcoin, Ethereum, crypto, DeFi.
-Write plain text only — no <cite> tags, no XML, no markdown.
+Plain text only — no <cite> tags, no XML, no markdown.
 
 Respond ONLY with a JSON array:
 [{{"headline":"short headline","detail":"one neutral sentence","category":"Macro|Geopolitics|Trade|Energy|Finance|Policy","url":"source URL or null"}}]"""
 
-    print("⏳ Waiting 30s before API call...")
+    print("⏳ Waiting 30s...")
     time.sleep(30)
-    message = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=800,
-        tools=[{"type": "web_search_20250305", "name": "web_search"}],
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text  = "".join(b.text for b in message.content if hasattr(b, "text"))
-    text  = clean_text(text.replace("```json","").replace("```","").strip())
+    text  = clean_text(ai_call(prompt, use_search=True, max_tokens=800).replace("```json","").replace("```","").strip())
     items = json.loads(text[text.find("["):text.rfind("]")+1])
     for item in items:
         item["headline"] = clean_text(item.get("headline",""))
         item["detail"]   = clean_text(item.get("detail",""))
     print(f"✅ Got {len(items)} must-know items")
 
-    summary_resp = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=200,
-        messages=[{"role":"user","content":f"In 2-3 neutral sentences summarize the macro/geopolitical backdrop today based on: {json.dumps([i['headline'] for i in items])}. Plain text only, no tags."}],
-    )
-    return {"summary": clean_text(summary_resp.content[0].text.strip()), "items": items}
+    summary = clean_text(ai_call(
+        f"2-3 neutral sentences summarizing macro/geopolitical backdrop today based on: {json.dumps([i['headline'] for i in items])}. Plain text only.",
+        max_tokens=200
+    ).strip())
+    return {"summary": summary, "items": items}
 
 
-def fetch_topic_news(client, today_str, topic_configs):
-    """Fetch in batches of 5, using keywords from the config sheet."""
+def fetch_topic_news(today_str, topic_configs):
     BATCH_SIZE = 5
-    batches = [topic_configs[i:i+BATCH_SIZE] for i in range(0, len(topic_configs), BATCH_SIZE)]
+    batches    = [topic_configs[i:i+BATCH_SIZE] for i in range(0, len(topic_configs), BATCH_SIZE)]
     all_results = {}
 
     for i, batch in enumerate(batches):
@@ -185,35 +193,23 @@ def fetch_topic_news(client, today_str, topic_configs):
             print(f"⏳ Waiting 15s before batch {i+1}...")
             time.sleep(15)
 
-        topic_lines = "\n".join([
-            f'- {t["topic"]}: search for {t["keywords"]}'
-            for t in batch
-        ])
+        topic_lines = "\n".join([f'- {t["topic"]}: {t["keywords"]}' for t in batch])
         names = [t["topic"] for t in batch]
-        prompt = f"""Today is {today_str}. Search for latest news (last 48h) for these topics:
+        prompt = f"""Today is {today_str}. Search for latest news (last 48h) using these queries:
 
 {topic_lines}
 
-For each topic return 2-3 bullet points tagged BULLISH, BEARISH, or NEUTRAL.
-Write plain text only — absolutely no <cite> tags, no XML tags, no markdown.
-If no news found, return one NEUTRAL bullet saying so.
+For each topic return 2-3 bullets tagged BULLISH, BEARISH, or NEUTRAL.
+If you searched but found NO relevant news, use: {{"sentiment":"neutral","text":"No relevant news found in last 48h.","url":null}}
+If search FAILED due to an error, use: {{"sentiment":"neutral","text":"Search unavailable for this topic.","url":null}}
+Plain text only — no <cite> tags, no XML.
 
 Respond ONLY with JSON:
-{{
-  "{names[0]}": [{{"sentiment":"bullish","text":"plain text summary","url":"URL or null"}}],
-  ...
-}}"""
+{{"{names[0]}":[{{"sentiment":"bullish","text":"plain summary","url":"URL or null"}}],...}}"""
+
         try:
-            message = client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=1500,
-                tools=[{"type": "web_search_20250305", "name": "web_search"}],
-                messages=[{"role":"user","content":prompt}],
-            )
-            text = "".join(b.text for b in message.content if hasattr(b, "text"))
-            text = clean_text(text.replace("```json","").replace("```","").strip())
+            text = clean_text(ai_call(prompt, use_search=True, max_tokens=1500).replace("```json","").replace("```","").strip())
             batch_data = json.loads(text[text.find("{"):text.rfind("}")+1])
-            # Clean all text fields
             for topic, items in batch_data.items():
                 for item in items:
                     item["text"] = clean_text(item.get("text",""))
@@ -222,38 +218,42 @@ Respond ONLY with JSON:
         except Exception as e:
             print(f"⚠️ Batch failed {names}: {e}")
             for t in batch:
-                all_results[t["topic"]] = [{"sentiment":"neutral","text":"Could not fetch news.","url":None}]
+                all_results[t["topic"]] = [{"sentiment":"neutral","text":"Search unavailable for this topic.","url":None}]
 
     return all_results
 
 
 # ── 4. Build payload ──────────────────────────────────────────────────────────
-def build_payload(today_str, now_taipei, must_know, topic_news, topic_configs, market_data, fg, cfg, cpi):
-    equity = [{"name":n,"price":market_data.get(n,{}).get("price","N/A"),"change_pct":market_data.get(n,{}).get("change_pct",0),"change_label":market_data.get(n,{}).get("change_label","—")} for n in ["S&P 500","Nasdaq 100","Nikkei 225","Hang Seng","DAX"]]
-    commodities = [{"name":n,"price":market_data.get(n,{}).get("price","N/A"),"change_pct":market_data.get(n,{}).get("change_pct",0),"change_label":market_data.get(n,{}).get("change_label","—"),"note":market_data.get(n,{}).get("note","")} for n in ["WTI Crude Oil","Natural Gas","Gold","Silver"]]
-    macro = []
-    for n in ["VIX","DXY Dollar Index"]:
-        d = market_data.get(n,{})
-        macro.append({"name":n,"price":d.get("price","N/A"),"change_pct":d.get("change_pct",0),"change_label":d.get("change_label","—"),"note":d.get("note","")})
-    macro.append({"name":"CNN Fear & Greed","price":str(fg.get("score","—")),"change_pct":0,"change_label":"","note":fg.get("label","")})
-    macro.append({"name":"Crypto Fear & Greed","price":str(cfg.get("score","—")),"change_pct":0,"change_label":"","note":cfg.get("label","")})
-    macro.append({"name":"US CPI (YoY)","price":cpi.get("yoy","N/A"),"change_pct":0,"change_label":f"as of {cpi.get('date','')}","note":""})
+def build_payload(today_str, now_str, must_know, topic_news, topic_configs, market_data, fg, cfg, cpi):
+    def mkt(name):
+        d = market_data.get(name,{})
+        return {"name":name,"price":d.get("price","N/A"),"change_pct":d.get("change_pct",0),
+                "change_label":d.get("change_label","—"),"note":d.get("note","")}
+
+    macro = [mkt("VIX"), mkt("DXY Dollar Index"),
+             {"name":"CNN Fear & Greed","price":str(fg.get("score","—")),"change_pct":0,"change_label":"","note":fg.get("label","")},
+             {"name":"Crypto Fear & Greed","price":str(cfg.get("score","—")),"change_pct":0,"change_label":"","note":cfg.get("label","")},
+             {"name":"US CPI (YoY)","price":cpi.get("yoy","N/A"),"change_pct":0,"change_label":f"as of {cpi.get('date','')}","note":""}]
 
     topics_out = []
     for tc in topic_configs:
         name  = tc["topic"]
-        items = topic_news.get(name, [])
+        items = topic_news.get(name,[])
         b = sum(1 for i in items if i.get("sentiment")=="bullish")
         r = sum(1 for i in items if i.get("sentiment")=="bearish")
-        overall = "bullish" if b>r else ("bearish" if r>b else "neutral")
-        topics_out.append({"name":name,"overall":overall,"items":items})
+        topics_out.append({"name":name,
+                            "overall":"bullish" if b>r else ("bearish" if r>b else "neutral"),
+                            "items":items})
 
     return {
-        "secret": WEBHOOK_SECRET,
-        "date": today_str,
-        "generated_at": now_taipei,
+        "secret": WEBHOOK_SECRET, "date": today_str, "generated_at": now_str,
+        "to_email": TO_EMAIL,
         "must_know": must_know,
-        "market": {"equity":equity,"commodities":commodities,"macro":macro},
+        "market": {
+            "equity":      [mkt(n) for n in ["S&P 500","Nasdaq 100","Nikkei 225","Hang Seng","DAX"]],
+            "commodities": [mkt(n) for n in ["WTI Crude Oil","Natural Gas","Gold","Silver"]],
+            "macro":       macro,
+        },
         "topics": topics_out,
     }
 
@@ -264,140 +264,50 @@ def post_to_sheets(payload):
     resp = requests.post(SHEETS_WEBHOOK_URL, json=payload, timeout=60)
     if resp.status_code == 200:
         result = resp.json()
-        if result.get("status") == "ok":
-            print(f"✅ Sheet updated! Rows written: {result.get('rows')}")
-        else:
-            print(f"⚠️ Apps Script error: {result.get('message')}")
+        status = result.get("status")
+        print(f"✅ Sheet updated! Rows: {result.get('rows')}" if status=="ok" else f"⚠️ Apps Script: {result.get('message')}")
     else:
-        print(f"❌ Webhook failed {resp.status_code}: {resp.text}")
-        raise Exception(f"Webhook failed: {resp.status_code}")
+        raise Exception(f"Webhook failed {resp.status_code}: {resp.text}")
 
 
-# ── 6. Send email via Resend (optional) ───────────────────────────────────────
-def build_email_html(payload):
-    """Convert the payload into a clean HTML email."""
-    p = payload
-    sc = {"bullish":("#EAF3DE","#3B6D11","▲"),"bearish":("#FCEBEB","#A32D2D","▼"),"neutral":("#F5F5F5","#666666","•")}
-    cat_bg = {"Macro":"#E6F1FB","Geopolitics":"#FCEBEB","Trade":"#FAEEDA","Energy":"#EAF3DE","Finance":"#EEEDFE","Policy":"#F1EFE8"}
-
-    def mkt_row(m):
-        pct = m.get("change_pct",0)
-        col = "#27AE60" if pct>0 else ("#E74C3C" if pct<0 else "#888")
-        note = f'<span style="font-size:10px;color:#aaa"> {m.get("note","")}</span>' if m.get("note") else ""
-        return f'<tr><td style="padding:5px 8px;font-weight:600;font-size:13px">{m["name"]}</td><td style="padding:5px 8px;font-size:14px;font-weight:700">{m["price"]}</td><td style="padding:5px 8px;font-weight:700;color:{col};font-size:13px">{m.get("change_label","—")}</td><td style="padding:5px 8px;font-size:10px;color:#aaa">{m.get("note","")}</td></tr>'
-
-    mkt_equity = "".join(mkt_row(m) for m in p["market"]["equity"])
-    mkt_comm   = "".join(mkt_row(m) for m in p["market"]["commodities"])
-    mkt_macro  = "".join(mkt_row(m) for m in p["market"]["macro"])
-
-    mk_rows = ""
-    for item in p["must_know"]["items"]:
-        bg = cat_bg.get(item.get("category",""),"#F9F9F9")
-        link = f'<a href="{item["url"]}" style="color:#666;font-size:10px">source ↗</a>' if item.get("url") else ""
-        mk_rows += f'<tr><td style="padding:10px 12px;background:{bg};border-bottom:1px solid #eee"><div style="display:flex;justify-content:space-between;margin-bottom:4px"><span style="font-size:10px;font-weight:700;padding:1px 7px;border-radius:10px;background:{bg};color:#333">{item.get("category","")}</span>{link}</div><div style="font-weight:700;font-size:13px;margin-bottom:3px">{item.get("headline","")}</div><div style="font-size:12px;color:#555">{item.get("detail","")}</div></td></tr>'
-
-    topic_rows = ""
-    for topic in p["topics"]:
-        overall = topic.get("overall","neutral")
-        bg0,fg0,_ = sc.get(overall,sc["neutral"])
-        topic_rows += f'<tr><td style="padding:8px 12px;background:#2C3E50"><span style="color:#fff;font-weight:700;font-size:13px">{topic["name"]}</span><span style="float:right;padding:1px 8px;border-radius:10px;background:{bg0};color:{fg0};font-size:10px;font-weight:700">{overall.upper()}</span></td></tr>'
-        for item in topic.get("items",[]):
-            s = item.get("sentiment","neutral")
-            bg,fg,dot = sc.get(s,sc["neutral"])
-            link = f' <a href="{item["url"]}" style="color:#aaa;font-size:10px">↗</a>' if item.get("url") else ""
-            topic_rows += f'<tr><td style="padding:7px 12px 7px 20px;background:{bg};border-bottom:1px solid #f0f0f0"><span style="color:{fg};font-weight:700">{dot}</span> <span style="font-size:12px;color:#333">{item.get("text","")}</span>{link}</td></tr>'
-        topic_rows += '<tr><td style="height:4px;background:#f9f9f9"></td></tr>'
-
-    return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"></head>
-<body style="margin:0;padding:0;background:#f0f0f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">
-<table width="100%" style="background:#f0f0f0;padding:20px 0"><tr><td align="center">
-<table width="600" style="max-width:600px;background:#fff;border-radius:10px;overflow:hidden">
-<tr><td style="background:#1a1a1a;padding:20px 24px"><p style="margin:0;font-size:18px;font-weight:700;color:#fff">📊 Daily Market Brief</p><p style="margin:4px 0 0;font-size:11px;color:#aaa">{p["date"]} · Generated {p["generated_at"]}</p></td></tr>
-
-<tr><td style="background:#C0392B;padding:10px 24px"><p style="margin:0;font-size:12px;font-weight:700;color:#fff;letter-spacing:.05em">🌍 MUST KNOW TODAY</p></td></tr>
-<tr><td style="padding:12px 24px;background:#FEF9F9;font-style:italic;font-size:12px;color:#555">{p["must_know"]["summary"]}</td></tr>
-<tr><td style="padding:0 24px 16px"><table width="100%">{mk_rows}</table></td></tr>
-
-<tr><td style="background:#1A5276;padding:10px 24px"><p style="margin:0;font-size:12px;font-weight:700;color:#fff;letter-spacing:.05em">📈 MARKET DASHBOARD</p></td></tr>
-<tr><td style="padding:12px 24px">
-  <p style="margin:0 0 6px;font-size:10px;font-weight:700;color:#2980B9;letter-spacing:.05em">EQUITY</p>
-  <table width="100%">{mkt_equity}</table>
-  <p style="margin:12px 0 6px;font-size:10px;font-weight:700;color:#D35400;letter-spacing:.05em">COMMODITIES</p>
-  <table width="100%">{mkt_comm}</table>
-  <p style="margin:12px 0 6px;font-size:10px;font-weight:700;color:#1E8449;letter-spacing:.05em">MACRO & SENTIMENT</p>
-  <table width="100%">{mkt_macro}</table>
-</td></tr>
-
-<tr><td style="background:#2C3E50;padding:10px 24px"><p style="margin:0;font-size:12px;font-weight:700;color:#fff;letter-spacing:.05em">📰 TRACKED TOPICS</p></td></tr>
-<tr><td style="padding:0 24px 16px"><table width="100%">{topic_rows}</table></td></tr>
-
-<tr><td style="padding:14px 24px;text-align:center;background:#f9f9f9"><p style="margin:0;font-size:10px;color:#aaa">Sources: Anthropic Web Search · Yahoo Finance · CNN · Alternative.me · FRED · Not financial advice</p></td></tr>
-</table></td></tr></table>
-</body></html>"""
-
-
-def send_email(html, subject):
-    if not RESEND_API_KEY or not TO_EMAIL:
-        print("⏭ Skipping email — RESEND_API_KEY or TO_EMAIL not set")
-        return
-    print(f"📧 Sending email via Resend to {TO_EMAIL}...")
-    resp = requests.post(
-        "https://api.resend.com/emails",
-        headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
-        json={"from": "Daily Brief <onboarding@resend.dev>", "to": [TO_EMAIL], "subject": subject, "html": html},
-        timeout=30,
-    )
-    if resp.status_code in (200, 201):
-        print("✅ Email sent!")
-    else:
-        print(f"⚠️ Email failed {resp.status_code}: {resp.text}")
-
-
-# ── 7. Main ───────────────────────────────────────────────────────────────────
+# ── 6. Main ───────────────────────────────────────────────────────────────────
 def main():
     now       = datetime.now(TAIPEI_TZ)
     today_str = now.strftime("%A, %B %-d, %Y")
     now_str   = now.strftime("%I:%M %p TPE")
-    print(f"🚀 Running Daily Brief for {today_str}")
+    print(f"🚀 Running Daily Brief for {today_str} via {AI_PROVIDER.upper()}")
 
-    # Read topic config from sheet
     topic_configs = fetch_config()
-
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=120.0)
 
     print("📈 Fetching market data...")
     try:    market_data = fetch_market_data()
-    except Exception as e: print(f"⚠️ Market data failed: {e}"); market_data = {}
-
-    try:    fg = fetch_fear_greed()
-    except: fg = {"score":None,"label":"Unavailable"}
-
+    except Exception as e: print(f"⚠️ {e}"); market_data = {}
+    try:    fg  = fetch_fear_greed()
+    except: fg  = {"score":None,"label":"Unavailable"}
     try:    cfg = fetch_crypto_fear_greed()
     except: cfg = {"score":None,"label":"Unavailable"}
-
     try:    cpi = fetch_us_cpi()
     except: cpi = {"value":"N/A","yoy":"N/A","date":"N/A"}
 
     print("🌍 Fetching must-know news...")
-    try:    must_know = fetch_must_know(client, today_str)
-    except Exception as e: print(f"⚠️ Must-know failed: {e}"); must_know = {"summary":"Could not fetch news today.","items":[]}
+    try:    must_know = fetch_must_know(today_str)
+    except Exception as e: print(f"⚠️ {e}"); must_know = {"summary":"Could not fetch news today.","items":[]}
 
     print("📰 Fetching topic news...")
-    try:    topic_news = fetch_topic_news(client, today_str, topic_configs)
-    except Exception as e: print(f"⚠️ Topic news failed: {e}"); topic_news = {}
+    try:    topic_news = fetch_topic_news(today_str, topic_configs)
+    except Exception as e: print(f"⚠️ {e}"); topic_news = {}
 
     payload = build_payload(today_str, now_str, must_know, topic_news, topic_configs, market_data, fg, cfg, cpi)
 
-    try:    post_to_sheets(payload)
-    except Exception as e: print(f"❌ Sheets failed: {e}")
-
     try:
-        html = build_email_html(payload)
-        send_email(html, f"📊 Daily Brief · {now.strftime('%b %-d, %Y')}")
-    except Exception as e: print(f"⚠️ Email failed: {e}")
+        post_to_sheets(payload)
+        if TO_EMAIL:
+            print("📧 Email will be sent by Google Apps Script via Gmail")
+        else:
+            print("⏭ No TO_EMAIL set — skipping email")
+    except Exception as e: print(f"❌ Sheets: {e}")
 
     print("✅ Done!")
-
 
 if __name__ == "__main__":
     main()
